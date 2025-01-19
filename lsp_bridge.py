@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# /// script
+# dependencies = [
+#   "epc",
+#   "orjson",
+#   "packaging",
+#   "sexpdata",
+#   "six",
+#   "setuptools",
+#   "paramiko",
+#   "rapidfuzz",
+#   "watchdog",
+# ]
+# ///
+
 # Copyright (C) 2022 Andy Stewart
 #
 # Author:     Andy Stewart <lazycat.manatee@gmail.com>
@@ -24,10 +38,8 @@ import shutil
 import threading
 import traceback
 import json
-import socket
 import time
 
-from collections import defaultdict
 from functools import wraps
 from pathlib import Path
 
@@ -40,7 +52,6 @@ from core.lspserver import LspServer
 from core.search_file_words import SearchFileWords
 from core.search_sdcv_words import SearchSdcvWords
 from core.search_list import SearchList
-from core.search_tailwindcss_keywords import SearchTailwindKeywords
 from core.search_paths import SearchPaths
 from core.tabnine import TabNine
 from core.codeium import Codeium
@@ -49,9 +60,14 @@ from core.utils import *
 from core.handler import *
 from core.remote_file import (
     RemoteFileClient,
-    RemoteFileServer,
+    DockerFileClient,
+    FileSyncServer,
+    FileElispServer,
+    FileCommandServer,
     SendMessageException,
-    save_ip
+    ContainerConnectionException,
+    save_ip,
+    get_container_local_ip
 )
 from core.ctags import Ctags
 
@@ -67,6 +83,7 @@ def threaded(func):
 REMOTE_FILE_SYNC_CHANNEL = 9999
 REMOTE_FILE_COMMAND_CHANNEL = 9998
 REMOTE_FILE_ELISP_CHANNEL = 9997
+
 
 class LspBridge:
     def __init__(self, args):
@@ -110,10 +127,10 @@ class LspBridge:
         # event_loop never exit, simulation event loop.
         self.event_loop.join()
 
-    @threaded
-    def ctags_complete(self, symbol, filename, cursor_offset):
-        self.ctags.make_complete(symbol, filename, cursor_offset)
+    def message_hostnames(self):
+        message_emacs(f"host_names:{self.host_names}")
 
+    # Functions for initialization
     def init_search_backends(self):
         # Init tabnine.
         self.tabnine = TabNine()
@@ -128,7 +145,6 @@ class LspBridge:
         self.search_file_words = SearchFileWords()
         self.search_sdcv_words = SearchSdcvWords()
         self.search_list = SearchList()
-        self.search_tailwind_keywords = SearchTailwindKeywords()
         self.search_paths = SearchPaths()
         self.ctags = Ctags()
 
@@ -146,7 +162,6 @@ class LspBridge:
             "search_file_words": ["index_files", "change_buffer", "load_file", "close_file", "search"],
             "search_sdcv_words": ["search"],
             "search_list": ["search", "update"],
-            "search_tailwind_keywords": ["search"],
             "search_paths": ["search"]
         }
         for search_backend, export_functions in search_backend_export_functions.items():
@@ -163,317 +178,72 @@ class LspBridge:
         self.message_thread = threading.Thread(target=self.message_dispatcher)
         self.message_thread.start()
 
-        # Build loop to open remote file.
-        self.remote_file_sender_queue = queue.Queue()
-        self.remote_file_sender_thread = threading.Thread(target=self.send_message_dispatcher,
-                                                          args=(self.remote_file_sender_queue, REMOTE_FILE_SYNC_CHANNEL))
-        self.remote_file_sender_thread.start()
-
-        # Build loop to call remote Python command.
-        self.remote_file_command_sender_queue = queue.Queue()
-        self.remote_file_command_sender_thread = threading.Thread(target=self.send_message_dispatcher,
-                                                         args=(self.remote_file_command_sender_queue, REMOTE_FILE_COMMAND_CHANNEL))
-        self.remote_file_command_sender_thread.start()
-
-        # Build loop to send remote file to local Emacs.
-        self.remote_file_receiver_queue = queue.Queue()
-        self.remote_file_receiver_thread = threading.Thread(target=self.receive_message_dispatcher,
-                                                            args=(self.remote_file_receiver_queue, self.handle_remote_file_message))
-        self.remote_file_receiver_thread.start()
-
-        # Build loop to send elisp command from remote server to local Emacs.
-        self.remote_file_command_receiver_queue = queue.Queue()
-        self.remote_file_command_receiver_thread = threading.Thread(
-            target=self.receive_message_dispatcher,
-            args=(self.remote_file_command_receiver_queue, self.handle_lsp_message))
-        self.remote_file_command_receiver_thread.start()
-
-    def send_message_dispatcher(self, queue, port):
-        try:
-            while True:
-                data = queue.get(True)
-
-                server_host = data["host"]
-                client = self.get_socket_client(server_host, port)
-                try:
-                    client.send_message(data["message"])
-                except SendMessageException as e:
-                    # lsp-bridge process might has been restarted, making the orignal socket no longer valid.
-                    logger.exception("Channel %s is broken, message %s, error %s", f"{server_host}:{port}", data["message"], e)
-                    # remove all the clients for server_host from client_dict
-                    # client will be created again when get_socket_client is called
-                    self.client_dict.pop(f"{server_host}:{REMOTE_FILE_SYNC_CHANNEL}", None)
-                    self.client_dict.pop(f"{server_host}:{REMOTE_FILE_COMMAND_CHANNEL}", None)
-                    self.client_dict.pop(f"{server_host}:{REMOTE_FILE_ELISP_CHANNEL}", None)
-
-                    message_emacs(f"try to recreate channel to {server_host}:{port}")
-                    try:
-                        client = self.get_socket_client(server_host, port)
-                    except Exception as e:
-                        # unable to restore the channel
-                        logger.exception(e)
-                    else:
-                        # try to send the message
-                        client.send_message(data["message"])
-                        eval_in_emacs('lsp-bridge-remote-reconnect', server_host)
-                except Exception as e:
-                    logger.exception(e)
-                finally:
-                    queue.task_done()
-        except:
-            logger.error(traceback.format_exc())
-
-    def receive_message_dispatcher(self, queue, handle_remote_file_message):
-        try:
-            while True:
-                message = queue.get(True)
-                handle_remote_file_message(message)
-                queue.task_done()
-        except:
-            logger.error(traceback.format_exc())
-
-    @threaded
-    def open_remote_file(self, path, jump_define_pos):
-        if is_valid_ip_path(path):
-            # open_remote_file path notation
-            # ip:path
-            # ip:port:path
-            path_info = split_ssh_path(path)
-            if path_info:
-                (server_username, server_host, ssh_port, server_path) = path_info
-
-                if not server_username:
-                    if server_host in self.host_names:
-                        server_username = self.host_names[server_host]["username"]
-                    else:
-                        server_username = "root"
-
-                if not ssh_port:
-                    if server_host in self.host_names:
-                        ssh_port = self.host_names[server_host]["ssh_port"]
-                    else:
-                        ssh_port = 22
-
-                self.host_names[server_host] = {
-                    "username": server_username,
-                    "ssh_port": ssh_port,
-                    "use_gssapi": False,
-                    "proxy_command": None
+        if not self.running_in_server:
+            remote_threads = {
+                "send_message_dispatcher": {
+                    # Build loop to open remote file.
+                    "remote_file_sender_queue": REMOTE_FILE_SYNC_CHANNEL,
+                    # Build loop to call remote Python command.
+                    "remote_file_command_sender_queue": REMOTE_FILE_COMMAND_CHANNEL,
+                    # Build loop to reply remote rpc command.
+                    "remote_file_elisp_sender_queue": REMOTE_FILE_ELISP_CHANNEL
+                },
+                "receive_message_dispatcher": {
+                    # Build loop to receive remote file to local Emacs.
+                    "remote_file_receiver_queue": "handle_remote_file_message",
+                    # Build loop to receive remote Python command response from remote server to local Emacs.
+                    "remote_file_command_receiver_queue": "handle_lsp_message",
+                    # Build loop to receive remote rpc from remote server to local Emacs.
+                    "remote_file_elisp_receiver_queue": "handle_file_elisp_message"
                 }
+            }
 
-                client_id = f"{server_host}:{REMOTE_FILE_ELISP_CHANNEL}"
-                if client_id not in self.client_dict:
-                    client = self.get_socket_client(server_host, REMOTE_FILE_ELISP_CHANNEL)
-                    # send "say hello" upon establishing the first connection
-                    if client:
-                        client.send_message("Connect")
-
-                message_emacs(f"Open {server_username}@{server_host}#{ssh_port}:{server_path}...")
-                # Add TRAMP-related fields
-                # The following fields: tramp_method, user, server, port, and path
-                # are set as buffer-local variables in the buffer created by Emacs.
-                # These variables facilitate the construction of a TRAMP file name,
-                # and then allow the buffer to reconnect to a restarted remote lsp-bridge process
-                # using the same logic with reconnecting a TRAMP remote file buffer.
-                self.send_remote_file_message(server_host, {
-                    "command": "open_file",
-                    "tramp_method": "ssh",
-                    "user": server_username,
-                    "server": server_host,
-                    "port": ssh_port,
-                    "path": server_path,
-                    "jump_define_pos": epc_arg_transformer(jump_define_pos)
-                })
-                save_ip(f"{server_username}@{server_host}:{ssh_port}")
-        else:
-            message_emacs("Please input valid path match rule: 'ip:/path/file'.")
-
-    def message_hostnames(self):
-        message_emacs(f"host_names:{self.host_names}")
-
-    @threaded
-    def sync_tramp_remote(self, tramp_file_name, server_username, server_host, ssh_port, path):
-        # arguments are passed from emacs using standard TRAMP functions tramp-file-name-<field>
-        use_gssapi = False
-        proxy_command = None
-        alias = None
-        if not is_valid_ip(server_host):
-            alias = server_host
-            if alias in self.host_names:
-                server_host = self.host_names[alias]["server_host"]
-                server_username = self.host_names[alias]["username"]
-                ssh_port = self.host_names[alias]["ssh_port"]
-                use_gssapi = self.host_names[alias]["use_gssapi"]
-                proxy_command = self.host_names[alias]["proxy_command"]
-            else:
-                import paramiko
-                ssh_config = paramiko.SSHConfig()
-                with open(os.path.expanduser('~/.ssh/config')) as f:
-                    ssh_config.parse(f)
-                conf = ssh_config.lookup(alias)
-
-                server_host = conf.get('hostname', server_host)
-                server_username = conf.get('user', server_username)
-                ssh_port = conf.get('port', ssh_port)
-                use_gssapi = conf.get('gssapiauthentication', 'no') in ('yes')
-                proxy_command = conf.get('proxycommand', None)
-
-                self.host_names[alias] = {"server_host": server_host, "username": server_username, "ssh_port": ssh_port, "use_gssapi": use_gssapi,
-                                          "proxy_command": proxy_command}
-
-        if not is_valid_ip(server_host):
-            message_emacs("HostName Must be IP format.")
-
-        # this value is like /ssh:user@ip#port:
-        # it should not be called tramp-method to avoid confusion
-        # we call it TRAMP connection information
-        tramp_connection_info = tramp_file_name.rsplit(":", 1)[0] + ":"
-
-        if not server_username:
-            if server_host in self.host_names:
-                server_username = self.host_names[server_host]["username"]
-            else:
-                server_username = "root"
-
-        if not ssh_port:
-            if server_host in self.host_names:
-                ssh_port = self.host_names[server_host]["ssh_port"]
-            else:
-                ssh_port = 22
-
-        self.host_names[server_host] = {"username": server_username, "ssh_port": ssh_port, "use_gssapi": use_gssapi, "proxy_command": proxy_command}
-
-        client_id = f"{server_host}:{REMOTE_FILE_ELISP_CHANNEL}"
-        if client_id not in self.client_dict:
-            client = self.get_socket_client(server_host, REMOTE_FILE_ELISP_CHANNEL)
-            if client:
-                # send "say hello" upon establishing the first connection
-                client.send_message("Connect")
-
-            self.send_remote_file_message(server_host, {
-                "command": "tramp_sync",
-                "server": server_host,
-                "tramp_connection_info": tramp_connection_info,
-            })
-
-        eval_in_emacs("lsp-bridge-update-tramp-file-info", tramp_file_name, tramp_connection_info, server_host, path)
-        self.sync_tramp_remote_complete_event.set()
-
-    @threaded
-    def save_remote_file(self, remote_file_host, remote_file_path):
-        self.send_remote_file_message(remote_file_host, {
-            "command": "save_file",
-            "server": remote_file_host,
-            "path": remote_file_path
-        })
-
-    @threaded
-    def close_remote_file(self, remote_file_host, remote_file_path):
-        self.send_remote_file_message(remote_file_host, {
-            "command": "close_file",
-            "server": remote_file_host,
-            "path": remote_file_path
-        })
-
-    @threaded
-    def handle_remote_file_message(self, message):
-        data = parse_json_content(message)
-        command = data["command"]
-        if command == "open_file":
-            if "error" in data:
-                message_emacs(data["error"])
-            else:
-                eval_in_emacs(
-                    "lsp-bridge-open-remote-file--response",
-                    data["tramp_method"],
-                    data["user"],
-                    data["server"],
-                    data["port"],
-                    data["path"],
-                    string_to_base64(data["content"]),
-                    data["jump_define_pos"],
-                )
-                message_emacs(f"Open file {data['path']} on {data['server']}")
-
-    def handle_lsp_message(self, message):
-        data = parse_json_content(message)
-        if data["command"] == "eval-in-emacs":
-            # Execute emacs command from remote server.
-            eval_sexp_in_emacs(data["sexp"])
-
-    @threaded
-    def lsp_request(self, remote_file_host, remote_file_path, method, args):
-        if method == "change_file":
-            self.send_remote_file_message(remote_file_host, {
-                "command": "change_file",
-                "server": remote_file_host,
-                "path": remote_file_path,
-                "args": list(map(epc_arg_transformer, args))
-            })
-
-        self.send_lsp_bridge_message(remote_file_host, {
-            "command": "lsp_request",
-            "server": remote_file_host,
-            "path": remote_file_path,
-            "method": method,
-            "args": list(map(epc_arg_transformer, args))
-        })
-
-    @threaded
-    def func_request(self, remote_file_host, remote_file_path, method, args):
-        self.send_lsp_bridge_message(remote_file_host, {
-            "command": "func_request",
-            "server": remote_file_host,
-            "path": remote_file_path,
-            "method": method,
-            "args": list(map(epc_arg_transformer, args))
-        })
-
-    def send_remote_file_message(self, host, message):
-        self.remote_file_sender_queue.put({
-            "host": host,
-            "message": message
-        })
-
-    def send_lsp_bridge_message(self, host, message):
-        self.remote_file_command_sender_queue.put({
-            "host": host,
-            "message": message
-        })
+            for dispatcher, args in remote_threads.items():
+                for q, v in args.items():
+                    newq = queue.Queue()
+                    setattr(self, q, newq)
+                    if not isinstance(v, int):
+                        v = getattr(self, v)
+                    threading.Thread(
+                        target=getattr(self, dispatcher),
+                        args=(newq, v)
+                    ).start()
 
     @threaded
     def init_remote_file_server(self):
-        print("* Running lsp-bridge in remote server, use command 'lsp-bridge-open-remote-file' to open remote file.")
+        print("* Running lsp-bridge on remote server. "
+              "Access files with 'lsp-bridge-open-remote-file' or 'find-file /docker:...'")
 
-        # Build loop for call local Emacs function from server.
-        remote_file_server = RemoteFileServer("0.0.0.0", REMOTE_FILE_SYNC_CHANNEL)
-        self.remote_file_server = remote_file_server
-        set_remote_file_server(remote_file_server)
-
-        self.remote_file_elisp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.remote_file_elisp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.remote_file_elisp.bind(("0.0.0.0", REMOTE_FILE_ELISP_CHANNEL))
-        self.remote_file_elisp.listen(5)
-
-        self.remote_file_elisp_loop = threading.Thread(target=self.remote_file_elisp_dispatcher)
-        self.remote_file_elisp_loop.start()
+        # Build loop for remote files management.
+        self.file_server = FileSyncServer("0.0.0.0", REMOTE_FILE_SYNC_CHANNEL)
 
         # Build loop for call remote command from local Emacs.
-        self.remote_request = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.remote_request.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.remote_request.bind(("0.0.0.0", REMOTE_FILE_COMMAND_CHANNEL))
-        self.remote_request.listen(5)
+        # Start waiting for init_search_backends_complete_event
+        self.file_command_server = FileCommandServer("0.0.0.0", REMOTE_FILE_COMMAND_CHANNEL, self)
 
-        self.remote_request_socket = None
+        # Build loop for call local Emacs function from server.
+        # Signal that init_search_backends_complete_event is done
+        self.file_elisp_server = FileElispServer("0.0.0.0", REMOTE_FILE_ELISP_CHANNEL, self)
 
-        self.remote_request_loop = threading.Thread(target=self.remote_request_dispatcher)
-        self.remote_request_loop.start()
+        set_lsp_bridge_server(self)
 
+    # Functions for communication between local and remote server
     def get_socket_client(self, server_host, server_port, is_retry=False):
+        # currently only support SSH and docker
+        #
+        # try to distinguish SSH remote file or docker remote file using server_host
+        # if visiting docker remote file, container name is passed as server_host
+        if is_valid_ip(server_host):
+            return self._get_remtoe_file_client(server_host, server_port, is_retry)
+        else:
+            # server_host is the container_name
+            return self._get_docker_file_client(server_host, server_port)
+
+    def _get_remtoe_file_client(self, server_host, server_port, is_retry):
         if server_host not in self.host_names:
             message_emacs(f"{server_host} is not connected, try reconnect...")
             self.sync_tramp_remote_complete_event.clear()
-            eval_in_emacs('lsp-bridge-remote-reconnect', server_host)
+            eval_in_emacs('lsp-bridge-remote-reconnect', server_host, True)
             self.sync_tramp_remote_complete_event.wait()
             message_emacs(f"{server_host} connected.")
 
@@ -483,21 +253,16 @@ class LspBridge:
 
         import paramiko
 
-        server_username = self.host_names[server_host]["username"]
-        server_ssh_port = self.host_names[server_host]["ssh_port"]
+        ssh_conf = self.host_names[server_host]
         try:
             client = RemoteFileClient(
-                server_host,
-                server_username,
-                server_ssh_port,
+                ssh_conf,
                 server_port,
-                lambda message: self.receive_socket_message(message, server_port),
-                self.host_names[server_host]["use_gssapi"],
-                self.host_names[server_host]["proxy_command"]
+                lambda message: self.receive_remote_message(message, server_port),
             )
         except paramiko.AuthenticationException:
             # cloud not login server
-            message_emacs(f"login {server_username}@{server_host}:{server_ssh_port} failed, please check *lsp-bridge*")
+            message_emacs(f"login {ssh_conf} failed, please check *lsp-bridge*")
             return None
 
         try:
@@ -522,94 +287,351 @@ class LspBridge:
         else:
             client.start()
             self.client_dict[client_id] = client
+            return client
 
-        return client
+    def _get_docker_file_client(self, container_name, server_port):
+        client_id = f"{container_name}:{server_port}"
+        if client_id in self.client_dict:
+            return self.client_dict[client_id]
 
-    def receive_socket_message(self, message, server_port):
+        try:
+            client = DockerFileClient(
+                container_name=container_name,
+                server_port=server_port,
+                callback=lambda message: self.receive_remote_message(message, server_port),
+            )
+        except ContainerConnectionException as e:
+            print(f"Failed to connect {container_name}, is it running?")
+            raise e
+        else:
+            client.start()
+            self.client_dict[client_id] = client
+            return client
+
+    def send_remote_message(self, host, queue, message, wait=False):
+        queue.put({"host": host, "message": message})
+        if wait:
+            queue.join()
+
+    def send_message_dispatcher(self, queue, port):
+        try:
+            while True:
+                data = queue.get(True)
+
+                server_host = data["host"]
+                client = self.get_socket_client(server_host, port)
+                try:
+                    client.send_message(data["message"])
+                except SendMessageException as e:
+                    # lsp-bridge process might has been restarted, making the orignal socket no longer valid.
+                    logger.exception("Connection %s is broken, message %s, error %s", f"{server_host}:{port}", data["message"], e)
+                    # remove all the clients for server_host from client_dict
+                    # client will be created again when get_socket_client is called
+                    for client_id in [key for key in self.client_dict.keys() if key.startswith(server_host + ":")]:
+                        self.client_dict.pop(client_id, None)
+
+                    message_emacs(f"try to recreate connection to {server_host}:{port}")
+                    try:
+                        client = self.get_socket_client(server_host, port)
+                    except Exception as e:
+                        # FATAL: unable to restore
+                        logger.exception(e)
+                    else:
+                        # connection restored, try to send out the message
+                        client.send_message(data["message"])
+                        eval_in_emacs('lsp-bridge-remote-reconnect', server_host, False)
+                except Exception as e:
+                    logger.exception(e)
+                finally:
+                    queue.task_done()
+        except:
+            logger.error(traceback.format_exc())
+
+    def receive_remote_message(self, message, server_port):
         if server_port == REMOTE_FILE_SYNC_CHANNEL:
             self.remote_file_receiver_queue.put(message)
         elif server_port == REMOTE_FILE_COMMAND_CHANNEL:
             self.remote_file_command_receiver_queue.put(message)
         elif server_port == REMOTE_FILE_ELISP_CHANNEL:
-            # Receive elisp RPC call from remote server.
-            log_time(f"Receive remote message: {message}")
+            self.remote_file_elisp_receiver_queue.put(message)
 
-            data = parse_json_content(message)
-            host = data["host"]
-
-            # Read elisp code from local Emacs, and sendback to remote server.
-            client = self.get_socket_client(host, REMOTE_FILE_ELISP_CHANNEL)
-            if data["command"] == "get_emacs_func_result":
-                result = get_emacs_func_result(data["method"], *data["args"])
-            elif data["command"] == "get_emacs_vars":
-                result = get_emacs_vars(data["args"])
-            else:
-                logger.error("Unsupported command %s", data["command"])
-                result = None
-
-            if client:
-                client.send_message(result)
-
-    def remote_file_elisp_dispatcher(self):
+    def receive_message_dispatcher(self, queue, handle_remote_message):
         try:
             while True:
-                client_socket, client_address = self.remote_file_elisp.accept()
-                # remote server lsp-bridge process use this cient_socket to call elisp function from local Emacs.
-                log_time(f"Client connect from {client_address[0]}:{client_address[1]}")
-
-                set_remote_rpc_socket(client_socket, client_address[0])
-
-                # Drop first "say hello" message from local Emacs.
-                socket_file = client_socket.makefile("r")
-                socket_file.readline().strip()
-                socket_file.close()
-
-                self.init_search_backends()
-                log_time("init_search_backends finish")
-                # Signal that init_search_backends is done
-                self.init_search_backends_complete_event.set()
+                message = queue.get(True)
+                handle_remote_message(message)
+                queue.task_done()
         except:
-            print(traceback.format_exc())
+            logger.error(traceback.format_exc())
 
-    def remote_request_dispatcher(self):
-        try:
-            while True:
-                # Record server host when lsp-bridge running in remote server.
-                client_socket, client_address = self.remote_request.accept()
-                # we wait for init_search_backends to finish execution
-                # before start thread to handle remote request
-                log_time("wait for init_search_backends to finsih execution")
-                self.init_search_backends_complete_event.wait()
+    def remote_sync(self, host, remote_connection_info):
+        client_id = f"{host}:{REMOTE_FILE_ELISP_CHANNEL}"
+        if client_id not in self.client_dict:
+            # send "say hello" upon establishing the first connection
+            self.send_remote_message(
+                host, self.remote_file_elisp_sender_queue, "Connect", True)
 
-                set_lsp_file_host(client_address[0])
-                set_remote_eval_socket(client_socket)
-                self.remote_request_socket = client_socket
-
-                client_handler = threading.Thread(target=self.handle_remote_request)
-                client_handler.start()
-        except:
-            print(traceback.format_exc())
-
-    def handle_remote_request(self):
-        client_file = self.remote_request_socket.makefile('r')
-        while True:
-            # Receive Python command request from local Emacs.
-            message = client_file.readline().strip()
-            if not message:
-                break
-
-            message = parse_json_content(message)
-
-            if message["command"] == "lsp_request":
-                # Call LSP request.
-                self.event_queue.put({
-                    "name": "action_func",
-                    "content": ("_{}".format(message["method"]), [message["path"]] + message["args"])
+            self.send_remote_message(
+                host, self.remote_file_sender_queue, {
+                    "command": "remote_sync",
+                    "server": host,
+                    "remote_connection_info": remote_connection_info,
                 })
-            elif message["command"] == "func_request":
-                # Call lsp-bridge normal function.
-                getattr(self, message["method"])(*message["args"])
 
+    @threaded
+    def sync_tramp_remote(self, tramp_file_name, tramp_method, server_username, server_host, ssh_port, path):
+
+        # tramp_file_name format example:
+        #   /ssh:user@ip#port:/path/to/file
+        #   /docker:user@container:/path/to/file
+        # see https://www.gnu.org/software/tramp/#File-name-syntax
+        tramp_method_prefix = tramp_file_name.rsplit(":", 1)[0]
+
+        if tramp_method_prefix.startswith("/ssh"):
+
+            # arguments are passed from emacs using standard TRAMP functions tramp-file-name-<field>
+            if server_host in self.host_names:
+                server_host = self.host_names[server_host]['hostname']
+                ssh_conf = self.host_names[server_host]
+            elif is_valid_ip(server_host):
+                ssh_conf = {'hostname' : server_host}
+            else:
+                import paramiko
+                alias = server_host
+                ssh_config = paramiko.SSHConfig()
+                with open(os.path.expanduser('~/.ssh/config')) as f:
+                    ssh_config.parse(f)
+                ssh_conf = ssh_config.lookup(alias)
+
+                server_host = ssh_conf.get('hostname', server_host)
+                self.host_names[alias] = ssh_conf
+
+            if not is_valid_ip(server_host):
+                message_emacs("HostName Must be IP format.")
+
+            if server_username:
+                ssh_conf['user'] = server_username
+            if ssh_port:
+                ssh_conf['port'] = ssh_port
+            self.host_names[server_host] = ssh_conf
+
+            tramp_connection_info = tramp_method_prefix + ":"
+            self.remote_sync(server_host, tramp_connection_info)
+
+            eval_in_emacs("lsp-bridge-update-tramp-file-info", tramp_file_name, tramp_connection_info, tramp_method, server_username, server_host, path)
+            self.sync_tramp_remote_complete_event.set()
+
+        elif tramp_method_prefix.startswith("/docker"):
+            # when using tramp to connect to container, the tramp_file_name might be
+            #
+            # /docker:USER@CONTAINER:/path/to/file
+            # /docker:CONTAINER:/path/to/file
+            #
+            # see https://git.savannah.gnu.org/git/tramp.git listp/tramp-container.el
+            tramp_method_split = tramp_method_prefix.split(":")[1]
+            if "@" in tramp_method_split:
+                container_user, container_name = tramp_method_split.split("@")
+            else:
+                container_user = "root"
+                container_name = tramp_method_split
+
+            if not get_container_local_ip(container_name):
+                message_emacs(f"Cloud not get local ip of container {container_name}, is it running?")
+                return
+
+            # only support local container
+            self.host_names[container_name] = {
+                "server_host": "127.0.0.1",
+                "username": container_user
+            }
+
+            try:
+                tramp_connection_info = tramp_method_prefix + ":"
+                self.remote_sync(container_name, tramp_connection_info)
+                # container_name is used for emacs buffer local variable lsp-bridge-remote-file-host
+                eval_in_emacs("lsp-bridge-update-tramp-file-info", tramp_file_name, tramp_connection_info, tramp_method, container_user, container_name, path)
+                eval_in_emacs("lsp-bridge--setup-tramp-docker-buffer", tramp_file_name)
+                self.sync_tramp_remote_complete_event.set()
+            except Exception as e:
+                logger.exception(e)
+                message_emacs(f"Connect {container_user}@{container_name} failed")
+                raise e
+        else:
+            message_emacs(
+                f"Failed to access {tramp_file_name}, unsupported tramp methd: {tramp_method_prefix[1:]}, "
+                "please make sure `lsp_bridge.py` has started on server."
+            )
+
+    # Functions for local to manage remote files
+    @threaded
+    def open_remote_file(self, path, jump_define_pos):
+        if is_valid_ip_path(path):
+            # open_remote_file path notation
+            # ip:path
+            # ip:port:path
+            path_info = split_ssh_path(path)
+            if path_info:
+                (remote_info, server_host, ssh_conf, server_path) = path_info
+
+                self.host_names[server_host] = ssh_conf
+
+                self.remote_sync(server_host, f"/{remote_info}")
+
+                message_emacs(f"Open {remote_info}{server_path}...")
+                # Add TRAMP-related fields
+                # The following fields: tramp_method, user, server, port, and path
+                # are set as buffer-local variables in the buffer created by Emacs.
+                # These variables facilitate the construction of a TRAMP file name,
+                # and then allow the buffer to reconnect to a restarted remote lsp-bridge process
+                # using the same logic with reconnecting a TRAMP remote file buffer.
+                self.send_remote_message(
+                    server_host, self.remote_file_sender_queue, {
+                    "command": "open_file",
+                    "tramp_method": "ssh",
+                    "user": ssh_conf.get('user'),
+                    "server": server_host,
+                    "port": ssh_conf.get('port'),
+                    "path": server_path,
+                    "jump_define_pos": epc_arg_transformer(jump_define_pos)
+                })
+                save_ip(f"{remote_info}")
+        elif path.startswith("/docker:"):
+            # open_remote_file path notation
+            # /docker:user@container:/path/to/file
+            # /docker:container:/path/to/file
+            path_info = split_docker_path(path)
+            if path_info:
+                (container_user, server_host, server_path) = path_info
+
+                # only support local container
+                self.host_names[server_host] = {
+                    "server_host": "127.0.0.1",
+                    "username": container_user
+                }
+
+                self.remote_sync(server_host, path.rsplit(":", 1)[0] + ":")
+
+                message_emacs(f"Open {path}...")
+
+                self.send_remote_message(
+                    server_host, self.remote_file_sender_queue, {
+                        "command": "open_file",
+                        "tramp_method": "docker",
+                        "user": container_user,
+                        "server": server_host,
+                        "port": None,
+                        "path": server_path,
+                        "jump_define_pos": epc_arg_transformer(jump_define_pos)
+                })
+        else:
+            message_emacs(f"Unsupported remote path {path}")
+
+    @threaded
+    def update_remote_file(self, remote_file_host, remote_file_path, content):
+        self.send_remote_message(
+            remote_file_host, self.remote_file_sender_queue, {
+            "command": "update_file",
+            "server": remote_file_host,
+            "path": remote_file_path,
+            "content": content
+        })
+
+    @threaded
+    def save_remote_file(self, remote_file_host, remote_file_path):
+        self.send_remote_message(
+            remote_file_host, self.remote_file_sender_queue, {
+            "command": "save_file",
+            "server": remote_file_host,
+            "path": remote_file_path
+        })
+
+    @threaded
+    def close_remote_file(self, remote_file_host, remote_file_path):
+        self.send_remote_message(
+            remote_file_host, self.remote_file_sender_queue, {
+            "command": "close_file",
+            "server": remote_file_host,
+            "path": remote_file_path
+        })
+
+    # Functions for local to send request to remote server
+    @threaded
+    def lsp_request(self, remote_file_host, remote_file_path, method, args):
+        if method == "change_file":
+            self.send_remote_message(
+                remote_file_host, self.remote_file_sender_queue, {
+                "command": "change_file",
+                "server": remote_file_host,
+                "path": remote_file_path,
+                "args": list(map(epc_arg_transformer, args))
+            })
+
+        self.send_remote_message(
+            remote_file_host, self.remote_file_command_sender_queue, {
+            "command": "lsp_request",
+            "server": remote_file_host,
+            "path": remote_file_path,
+            "method": method,
+            "args": list(map(epc_arg_transformer, args))
+        })
+
+    @threaded
+    def func_request(self, remote_file_host, remote_file_path, method, args):
+        self.send_remote_message(
+            remote_file_host, self.remote_file_command_sender_queue, {
+            "command": "func_request",
+            "server": remote_file_host,
+            "path": remote_file_path,
+            "method": method,
+            "args": list(map(epc_arg_transformer, args))
+        })
+
+    # Functions for local to handle messages from remote server
+    @threaded
+    def handle_remote_file_message(self, message):
+        command = message["command"]
+        if command == "open_file":
+            if "error" in message:
+                message_emacs(message["error"])
+            else:
+                eval_in_emacs(
+                    "lsp-bridge-open-remote-file--response",
+                    message["tramp_method"],
+                    message["user"],
+                    message["server"],
+                    message["port"],
+                    message["path"],
+                    string_to_base64(message["content"]),
+                    message["jump_define_pos"],
+                )
+                message_emacs(f"Open file {message['path']} on {message['server']}")
+
+    @threaded
+    def handle_lsp_message(self, message):
+        if message["command"] == "eval-in-emacs":
+            # Execute emacs command from remote server.
+            eval_sexp_in_emacs(message["sexp"])
+
+    @threaded
+    def handle_file_elisp_message(self, message):
+        # Receive elisp RPC call from remote server.
+        log_time(f"Receive server elisp RPC: {message}")
+
+        host = message["host"]
+
+        # Read elisp code from local Emacs, and sendback to remote server.
+        if message["command"] == "get_emacs_func_result":
+            result = get_emacs_func_result(message["method"], *message["args"])
+        elif message["command"] == "get_emacs_vars":
+            result = get_emacs_vars(message["args"])
+        else:
+            logger.error("Unsupported command %s", message["command"])
+            result = None
+
+        message["result"] = result
+        self.send_remote_message(host, self.remote_file_elisp_sender_queue, message)
+
+    # Functions for local handling
     def event_dispatcher(self):
         try:
             while True:
@@ -658,13 +680,7 @@ class LspBridge:
             create_file_action_with_single_server(filepath, lang_server_info, lsp_server)
         elif multi_lang_server:
             # Try to load multi language server when get-multi-lang-server return match one.
-            multi_lang_server_dir = Path(__file__).resolve().parent / "multiserver"
-            multi_lang_server_path = multi_lang_server_dir / "{}.json".format(multi_lang_server)
-
-            user_multi_lang_server_dir = Path(str(get_emacs_vars(["lsp-bridge-user-multiserver-dir"])[0])).expanduser()
-            user_multi_lang_server_path = user_multi_lang_server_dir / "{}.json".format(multi_lang_server)
-            if user_multi_lang_server_path.exists():
-                multi_lang_server_path = user_multi_lang_server_path
+            multi_lang_server_path = get_lang_server_path(multi_lang_server, True)
 
             with open(multi_lang_server_path, encoding="utf-8", errors="ignore") as f:
                 multi_lang_server_info = json.load(f)
@@ -721,6 +737,13 @@ class LspBridge:
         if is_in_path_dict(FILE_ACTION_DICT, filepath):
             get_from_path_dict(FILE_ACTION_DICT, filepath).exit()
 
+    def close_all_files(self):
+        FILE_ACTION_DICT.clear()
+
+        for lsp_server in LSP_SERVER_DICT.values():
+            lsp_server.exit()
+        LSP_SERVER_DICT.clear()
+
     def enjoy_hacking(self, servers, project_path):
         # Notify user server is ready.
         print("Start lsp server ({}) for {}".format(", ".join(servers), project_path))
@@ -739,14 +762,26 @@ class LspBridge:
 
         lang_server_info = load_single_server_info(single_lang_server)
 
+        # If project_path is file path, not dir.
         if ((not os.path.isdir(project_path)) and
-            "support-single-file" in lang_server_info and
-            lang_server_info["support-single-file"] is False):
-            self.turn_off(
-                filepath,
-                "ERROR: {} not support single-file, you need put this file in a git repository".format(single_lang_server))
+            ("support-single-file" in lang_server_info and
+             lang_server_info["support-single-file"] is False)):
 
-            return False
+            if "projectFiles" in lang_server_info:
+                # If support-support-single-file is False,
+                # we will search projectFiles up 20 level directories to find project root.
+                project_root = self.find_project_root(filepath, lang_server_info["projectFiles"])
+                if project_root is None:
+                    self.turn_off_by_single_file(filepath, single_lang_server)
+
+                    return False
+                else:
+                    # Replace project_path with project root path.
+                    project_path = project_root
+            else:
+                self.turn_off_by_single_file(filepath, single_lang_server)
+
+                return False
 
         lsp_server = self.create_lsp_server(filepath, project_path, lang_server_info)
 
@@ -759,10 +794,31 @@ class LspBridge:
 
         return True
 
+    def find_project_root(self, filepath, project_files, max_depth=20):
+        current_dir = os.path.abspath(filepath)
+
+        for _ in range(max_depth):
+            for file in project_files:
+                if os.path.isfile(os.path.join(current_dir, file)):
+                    return current_dir
+
+            parent_dir = os.path.dirname(current_dir)
+            if parent_dir == current_dir: # reach topest dir
+                break
+
+            current_dir = parent_dir
+
+        return None
+
     def turn_off(self, filepath, message):
         if os.path.splitext(filepath)[1] != ".txt":
             message_emacs(message + ", disable LSP feature.")
             eval_in_emacs("lsp-bridge--turn-off-lsp-feature", filepath, get_lsp_file_host())
+
+    def turn_off_by_single_file(filepath, single_lang_server):
+        self.turn_off(
+            filepath,
+            "ERROR: {} not support single-file, you need put this file in a git repository or put .dir-locals.el in project root directory".format(single_lang_server))
 
     def check_lang_server_command(self, lang_server_info, filepath, turn_off_on_error=True):
         # We merge PATH from `exec-path` variable, to make sure lsp-bridge find LSP server command if it can find by Emacs.
@@ -895,11 +951,20 @@ class LspBridge:
     def tabnine_complete(self, before, after, filename, region_includes_beginning, region_includes_end, max_num_results):
         self.tabnine.complete(before, after, filename, region_includes_beginning, region_includes_end, max_num_results)
 
+    @threaded
+    def ctags_complete(self, symbol, filename, max_lines, cursor_offset):
+        self.ctags.make_complete(symbol, filename, max_lines, cursor_offset)
+
+    @threaded
+    def ctags_find_def(self, symbol, filename):
+        self.ctags.find_definition(symbol, filename)
+
     def copilot_complete(self, position, editor_mode, file_path, relative_path, tab_size, text, insert_spaces):
         self.copilot.complete(position, editor_mode, file_path, relative_path, tab_size, text, insert_spaces)
 
-    def codeium_complete(self, cursor_offset, editor_language, tab_size, text, insert_spaces, prefix, language):
-        self.codeium.complete(cursor_offset, editor_language, tab_size, text, insert_spaces, prefix, language)
+    @threaded
+    def codeium_complete(self, cursor_offset, editor_language, tab_size, text, insert_spaces, prefix, language, file_path):
+        self.codeium.complete(cursor_offset, editor_language, tab_size, text, insert_spaces, prefix, language, file_path)
 
     def codeium_completion_accept(self, id):
         self.codeium.accept(id)
@@ -927,8 +992,14 @@ class LspBridge:
             log_time("Exit server {}".format(server_name))
             del LSP_SERVER_DICT[server_name]
 
+    def close_client(self):
+        for client in self.client_dict.values():
+            if hasattr(client, "kill_lsp_bridge_process"):
+                client.kill_lsp_bridge_process()
+
     def cleanup(self):
         """Do some cleanup before exit python process."""
+        self.close_client()
         close_epc_client()
 
     def start_test(self):
@@ -948,24 +1019,17 @@ def read_lang_server_info(lang_server_path):
     lang_server_info = json.load(lang_server_path)
 
     # Replace template in command options.
-    command_args = lang_server_info["command"]
-    for i, arg in enumerate(command_args):
-        command_args[i] = replace_template(arg)
-    lang_server_info["command"] = command_args
+    lang_server_info["command"] = eval(replace_template(str(lang_server_info["command"])))
 
     # Replace template in initializationOptions.
     if "initializationOptions" in lang_server_info:
-        initialization_options_args = lang_server_info["initializationOptions"]
-        for i, arg in enumerate(initialization_options_args):
-            if isinstance(initialization_options_args[arg], str):
-                initialization_options_args[arg] = replace_template(initialization_options_args[arg])
-        lang_server_info["initializationOptions"] = initialization_options_args
+        lang_server_info["initializationOptions"] = eval(replace_template(str(lang_server_info["initializationOptions"])))
 
     return lang_server_info
 
 def load_single_server_info(lang_server):
     lang_server_info_path = ""
-    if os.path.exists(lang_server) and os.path.dirname(lang_server) != "":
+    if isinstance(lang_server, str) and os.path.exists(lang_server) and os.path.dirname(lang_server) != "":
         # If lang_server is real file path, we load the LSP server configuration from the user specified file.
         lang_server_info_path = lang_server
     else:
@@ -975,12 +1039,15 @@ def load_single_server_info(lang_server):
     with open(lang_server_info_path, encoding="utf-8", errors="ignore") as f:
         return read_lang_server_info(f)
 
-def get_lang_server_path(server_name):
-    server_dir = Path(__file__).resolve().parent / "langserver"
+def get_lang_server_path(server_name, is_multi_server=False):
+    lang_server_dir = "multiserver" if is_multi_server else "langserver"
+    lang_server_dir_var = "lsp-bridge-user-multiserver-dir" if is_multi_server else "lsp-bridge-user-langserver-dir"
+
+    server_dir = Path(__file__).resolve().parent / lang_server_dir
     server_path_current = server_dir / "{}_{}.json".format(server_name, get_os_name())
     server_path_default = server_dir / "{}.json".format(server_name)
 
-    user_server_dir = Path(str(get_emacs_vars(["lsp-bridge-user-langserver-dir"])[0])).expanduser()
+    user_server_dir = Path(str(get_emacs_vars([lang_server_dir_var])[0])).expanduser()
     user_server_path_current = user_server_dir / "{}_{}.json".format(server_name, get_os_name())
     user_server_path_default = user_server_dir / "{}.json".format(server_name)
 

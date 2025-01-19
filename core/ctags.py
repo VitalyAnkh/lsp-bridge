@@ -25,6 +25,12 @@ DEFAULT_FILTER_CMD = '(not (or (and $extras ((string->regexp "(^|,) ?(anonymous|
 
 DEFAULT_SORTER_CMD = '(<or> (if (and $name &name) (<> (length $name) (length &name)) 0) (if (and $name &name) (<> $name &name) 0))'
 
+# for Python 3.9-
+def remove_prefix(text, prefix):
+    if text.startswith(prefix):
+        return text[len(prefix):]
+    return text
+
 class Ctags:    
     def __init__(self) -> None:
         self.current_cursor_offset = 0
@@ -80,7 +86,7 @@ class Ctags:
         extras = tag.get("extras", "")
         reference = "<R>" if "reference" in extras else ""
 
-        typeref = typeref.removeprefix("typename:")
+        typeref = remove_prefix(typeref, "typename:")
         typeref = re.sub(r'(^|:)(__anon[^:]+)(:|$)', r'\1__anon\3', typeref)
         scope = re.sub(r'(^|:)(__anon[^:]+)(:|$)', r'\1__anon\3', scope)
 
@@ -124,7 +130,7 @@ class Ctags:
             
         return None
 
-    def make_complete(self, symbol, filename, cursor_offset):
+    def make_complete(self, symbol, filename, max_lines, cursor_offset):
         self.lock.acquire()
         try:
             self.current_cursor_offset = cursor_offset
@@ -141,11 +147,48 @@ class Ctags:
         cmd = self.readtags_get_cmd(tagsfile, symbol, "prefix", False, DEFAULT_FILTER_CMD, DEFAULT_SORTER_CMD, "")
 
         lines = self.run_cmd_in_path(cmd, filename)
+        lines = lines[0:max_lines]
         
         tags = map(self.parse_tag_line, lines)
         candidates = map(self.make_ctags_acm_candidate, tags)
 
         self.dispatch(list(candidates), cursor_offset)
+
+    def make_xref(self, tag: dict, rootdir):
+        candidate = {}
+        tagname = tag["tagname"]
+
+        path = tag.get("tagfile", "")
+        line = int(tag.get("line", "1"))
+        pattern = tag.get("tagaddress", "")
+        annotation = self.make_tag_annotation(tag)
+
+        ext_abspath = os.path.join(rootdir, path)
+        tramp_method = get_remote_connection_info()
+
+        candidate["ext-abspath"] = tramp_method + ext_abspath
+        candidate["line"] = line
+        candidate["str"] = pattern[2:-2]
+        candidate["annotation"] = annotation
+
+        return candidate
+
+    def find_definition(self, symbol, filename):
+        tagsfile = self.locate_dominating_file(filename, "tags")
+        if not tagsfile:
+            return
+
+        cmd = self.readtags_get_cmd(tagsfile, symbol, "exact", False, "", "", "")
+        lines = self.run_cmd_in_path(cmd, filename)
+        tags = map(self.parse_tag_line, lines)
+
+        candidates = map(lambda tag: self.make_xref(tag, os.path.dirname(tagsfile)), tags)
+        candidates = list(candidates)
+
+        if candidates == []:
+            message_emacs(f"symbol {symbol} not found by ctags")
+        else:
+            eval_in_emacs("acm-backend-ctags-xref-callback", candidates)
 
     def dispatch(self, candidates, cursor_offset):
         self.lock.acquire()

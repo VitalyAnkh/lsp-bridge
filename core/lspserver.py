@@ -30,6 +30,8 @@ from subprocess import PIPE
 from sys import stderr
 from typing import TYPE_CHECKING, Dict
 from urllib.parse import urlparse
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 from core.handler import Handler
 from core.mergedeep import merge
@@ -39,6 +41,36 @@ if TYPE_CHECKING:
 from core.utils import *
 
 DEFAULT_BUFFER_SIZE = 100000000  # we need make buffer size big enough, avoid pipe hang by big data response from LSP server
+
+INLAY_HINT_REQUEST_ID_DICT = {}
+
+class MultiFileHandler(FileSystemEventHandler):
+    def __init__(self, lsp_server):
+        self.lsp_server = lsp_server
+        self.file_path_dict = {}
+        self.dir_path_dict = {}
+
+    def add_file(self, file_path):
+        self._add_to_dict(self.file_path_dict, file_path)
+
+    def add_dir(self, dir_path):
+        self._add_to_dict(self.dir_path_dict, dir_path)
+
+    def _add_to_dict(self, dictionary, path):
+        dictionary[os.path.abspath(path)] = path
+
+    def on_created(self, event):
+        self._handle_event(event, 1)
+
+    def on_modified(self, event):
+        self._handle_event(event, 2)
+
+    def on_deleted(self, event):
+        self._handle_event(event, 3)
+
+    def _handle_event(self, event, change_type):
+        if not event.is_directory and event.src_path in self.file_path_dict:
+            self.lsp_server.send_workspace_did_change_watched_files(event.src_path, change_type)
 
 class LspServerSender(MessageSender):
     def __init__(self, process: subprocess.Popen, server_name, project_name):
@@ -80,14 +112,21 @@ class LspServerSender(MessageSender):
         ), **kwargs)
 
     def send_message(self, message: dict):
-        json_content = json.dumps(message)
+        # message_type is not valid key of JSONRPC, we need remove message_type before send LSP server.
+        message_type = message.get("message_type")
+        message.pop("message_type")
 
+        # Parse json content.
+        json_content = json.dumps(message)
         message_str = "Content-Length: {}\r\n\r\n{}".format(len(json_content), json_content)
 
+        # Send to LSP server.
         self.process.stdin.write(message_str.encode("utf-8"))    # type: ignore
         self.process.stdin.flush()    # type: ignore
 
-        message_type = message.get("message_type")
+        # InlayHint will got error 'content modified' error if it followed immediately by a didChange request.
+        # So we need INLAY_HINT_REQUEST_ID_DICT to contain documentation path to send retry request.
+        record_inlay_hint_request(message)
 
         if message_type == "request" and \
            not message.get('method', 'response') == 'textDocument/documentSymbol':
@@ -131,6 +170,28 @@ class LspServerSender(MessageSender):
                 self.send_message(message)
         except:
             logger.error(traceback.format_exc())
+
+def record_inlay_hint_request(message):
+    # InlayHint will got error 'content modified' error if it followed immediately by a didChange request.
+    # So we need INLAY_HINT_REQUEST_ID_DICT to contain documentation path to send retry request.
+    if message.get("method", "response") == "textDocument/inlayHint":
+        try:
+            message_id = message.get("id")
+            message_documentation = message["params"]["textDocument"]["uri"]
+            INLAY_HINT_REQUEST_ID_DICT[message_id] = message_documentation
+        except:
+            pass
+
+def resend_inlay_hint_request_after_content_modified_error(message):
+    # Get message file path.
+    message_id = message.get("id")
+    message_documentation = INLAY_HINT_REQUEST_ID_DICT[message_id]
+
+    # Clean INLAY_HINT_REQUEST_ID_DICT to save memory.
+    INLAY_HINT_REQUEST_ID_DICT.pop(message_id)
+
+    # Call lsp-bridge-inlay-hint-retry to send retry request.
+    eval_in_emacs("lsp-bridge-inlay-hint-retry", message_documentation)
 
 class LspServerReceiver(MessageReceiver):
 
@@ -218,10 +279,27 @@ class LspServer:
         self.rename_prepare_provider = False
         self.code_action_provider = False
         self.code_format_provider = False
+        self.range_format_provider = False
         self.signature_help_provider = False
         self.workspace_symbol_provider = False
         self.inlay_hint_provider = False
         self.semantic_tokens_provider = False
+
+        # It's confused about LSP server's textDocumentSync capability.
+        # Python LSP server only have `willSave` field
+        # Rust LSP server only have `save` field
+        # nil LSP server no `willSave` or `save` field.
+        #
+        # So we include `sendSaveNotification` field for nil LSP server
+        # because most of LSP server support send save notification.
+        self.save_file_provider = True
+        if "sendSaveNotification" in server_info:
+            self.save_file_provider = server_info["sendSaveNotification"]
+
+        self.work_done_progress_title = ""
+
+        self.workspace_file_watcher = None
+        self.workspace_file_watch_handler = None
 
         self.code_action_kinds = [
             "quickfix",
@@ -235,11 +313,15 @@ class LspServer:
         self.save_include_text = False
 
         # Start LSP server.
+        cwd = self.project_path
+        if os.path.isfile(self.project_path): # single file
+            cwd = os.path.dirname(self.project_path)
         self.lsp_subprocess = subprocess.Popen(self.server_info["command"],
                                                bufsize=DEFAULT_BUFFER_SIZE,
                                                stdin=PIPE,
                                                stdout=PIPE,
-                                               stderr=stderr)
+                                               stderr=stderr,
+                                               cwd=cwd)
 
         # Two separate thread (read/write) to communicate with LSP server.
         self.receiver = LspServerReceiver(self.lsp_subprocess, self.server_info["name"])
@@ -306,6 +388,10 @@ class LspServer:
                     "resolveSupport": {
                         "properties": []
                     }
+                },
+                "didChangeWatchedFiles": {
+                    "dynamicRegistration": True,
+                    "relativePatternSupport": True
                 }
             },
             "textDocument": {
@@ -343,7 +429,26 @@ class LspServer:
                 },
                 "inlayHint": {
                     "dynamicRegistration": False
-                }
+                },
+                "hover": {
+                    "contentFormat": [
+                        "markdown",
+                        "plaintext"
+                    ],
+                    "dynamicRegistration": True
+                },
+                "formatting": {
+                    "dynamicRegistration": True
+                },
+                "rangeFormatting": {
+                    "dynamicRegistration": True
+                },
+                "onTypeFormatting": {
+                    "dynamicRegistration": True
+                },
+            },
+            "window": {
+                "workDoneProgress": True
             }
         })
 
@@ -398,14 +503,28 @@ class LspServer:
 
         return uri
 
-    def get_language_id(self, fa):
-        if "languageIds" in self.server_info:
-            _, extension = os.path.splitext(fa.filepath)
-            extension_name = extension.split(os.path.extsep)[-1]
-            if extension_name in self.server_info["languageIds"]:
-                return self.server_info["languageIds"][extension_name]
+    def get_server_name(self):
+        return self.server_name.split('#')[1] if '#' in self.server_name else self.server_name
 
-        return self.server_info["languageId"]
+    def get_language_id(self, fa):
+        # Get extension name.
+        _, extension = os.path.splitext(fa.filepath)
+        extension_name = extension.split(os.path.extsep)[-1].lower()
+
+        match_language_id = get_emacs_func_result("get-language-id", self.project_path, fa.filepath, self.get_server_name(), extension_name)
+
+        # User can customize `lsp-bridge--get-language-id-func` to support some advanced LSP server
+        # that need return language id with project environment, such as, TailwindCSS LSP server.
+        if isinstance(match_language_id, str):
+            return match_language_id
+        else:
+            if "languageIds" in self.server_info:
+                if extension_name in self.server_info["languageIds"]:
+                    return self.server_info["languageIds"][extension_name]
+
+            language_id = self.server_info["languageId"]
+
+            return extension_name if language_id == "" else language_id
 
     def send_did_open_notification(self, fa: "FileAction"):
         self.sender.send_notification("textDocument/didOpen", {
@@ -433,21 +552,30 @@ class LspServer:
         })
 
     def send_did_save_notification(self, filepath, buffer_name):
-        args = {
-            "textDocument": {
-                "uri": path_to_uri(filepath)
-            }
-        }
-
-        # Fetch buffer whole content to LSP server if server capability 'includeText' is True.
-        if self.save_include_text:
-            args = merge(args, {
+        if self.save_file_provider:
+            args = {
                 "textDocument": {
-                    "text": get_buffer_content(filepath, buffer_name)
+                    "uri": path_to_uri(filepath)
                 }
-            })
+            }
 
-        self.sender.send_notification("textDocument/didSave", args)
+            # Fetch buffer whole content to LSP server if server capability 'includeText' is True.
+            if self.save_include_text:
+                args = merge(args, {
+                    "textDocument": {
+                        "text": get_buffer_content(filepath, buffer_name)
+                    }
+                })
+
+            self.sender.send_notification("textDocument/didSave", args)
+
+    def send_workspace_did_change_watched_files(self, filepath, change_type):
+        self.sender.send_notification("workspace/didChangeWatchedFiles", {
+            "changes": [{
+                "uri": path_to_uri(filepath),
+                "type": change_type
+            }]
+        })
 
     def send_did_change_notification(self, filepath, version, start, end, range_length, text):
         # STEP 5: Tell LSP server file content is changed.
@@ -496,9 +624,21 @@ class LspServer:
         self.sender.send_notification("exit", {})
 
     def get_server_workspace_change_configuration(self):
-        return {
+        settings = {
             "settings": self.server_info.get("settings", {})
         }
+
+        if self.server_info["name"] == "csharp-ls":
+            # Set settings.csharp.solution if found *.sln file in project,
+            # to make sure csharp-ls find and load solution with project path, not current path.
+            settings = {
+                "settings": {
+                    "csharp": {
+                        "solution": find_csharp_solution_file(self.project_path)
+                    }
+                }}
+
+        return settings
 
     def handle_workspace_configuration_request(self, name, request_id, params):
         settings = self.server_info.get("settings", {})
@@ -512,23 +652,38 @@ class LspServer:
 
         # Otherwise, send back section value or default settings.
         items = []
+        server_name = self.server_info["name"]
         for p in params["items"]:
-            section = p.get("section", self.server_info["name"])
-            sessionSettings = settings.get(section, {})
+            section = p.get("section", server_name)
+            session_settings = settings.get(section, {})
 
-            if self.server_info["name"] == "vscode-eslint-language-server":
-                sessionSettings = settings
-                sessionSettings["workspaceFolder"] = {
+            if server_name == "vscode-eslint-language-server":
+                session_settings = settings
+                session_settings["workspaceFolder"] = {
                     "name": self.project_name,
                     "uri": path_to_uri(self.project_path),
                 }
 
-            items.append(sessionSettings)
+            elif server_name == "graphql-lsp":
+                session_settings = settings
+                session_settings["load"] = {
+                    "rootDir": self.project_path,
+                }
+
+            items.append(session_settings)
         self.sender.send_response(request_id, items)
 
     def handle_error_message(self, message):
         logger.error("Recv message (error):")
         logger.error(json.dumps(message, indent=3))
+
+        # InlayHint will got error 'content modified' error if it followed immediately by a didChange request.
+        # If we found this error, call lsp-bridge-inlay-hint-retry to send retry request.
+        if "id" in message:
+            message_id = message.get("id")
+            if message_id in INLAY_HINT_REQUEST_ID_DICT:
+                resend_inlay_hint_request_after_content_modified_error(message)
+                return
 
         error_message = message["error"]["message"]
         provider_attributes = {
@@ -536,6 +691,7 @@ class LspServer:
             "Unhandled method textDocument/prepareRename": "rename_prepare_provider",
             "Unhandled method textDocument/codeAction": "code_action_provider",
             "Unhandled method textDocument/formatting": "code_format_provider",
+            "Unhandled method textDocument/rangeFormatting": "range_format_provider",
             "Unhandled method textDocument/signatureHelp": "signature_help_provider",
             "Unhandled method workspace/symbol": "workspace_symbol_provider",
             "Unhandled method textDocument/inlayHint": "inlay_hint_provider",
@@ -586,28 +742,20 @@ class LspServer:
                 get_from_path_dict(self.files, filepath).record_dart_closing_lables(message["params"]["labels"])
 
     def handle_log_message(self, message):
-        # Notice user if got error message from lsp server.
         if "method" in message and message["method"] == "window/logMessage":
             try:
                 if "error" in message["params"]["message"].lower():
-                    message_emacs("{} ({}): {}".format(self.project_name, self.server_info["name"], message["params"]["message"]))
+                    print("{} ({}): {}".format(self.project_name, self.server_info["name"], message["params"]["message"]))
             except:
                 pass
 
     def set_attribute_from_message(self, message, attribute_name, key_list):
-        def get_nested_value(dct, keys):
-            for key in keys:
-                try:
-                    dct = dct[key]
-                except (KeyError, TypeError):
-                    return None
-            return dct
-
         value = get_nested_value(message, key_list)
         if value is not None:
             setattr(self, attribute_name, value)
 
     def save_attribute_from_message(self, message):
+        # Fetch LSP server's capability provider.
         attributes_to_set = [
             ("completion_trigger_characters", ["result", "capabilities", "completionProvider", "triggerCharacters"]),
             ("completion_resolve_provider", ["result", "capabilities", "completionProvider", "resolveProvider"]),
@@ -615,9 +763,14 @@ class LspServer:
             ("code_action_provider", ["result", "capabilities", "codeActionProvider"]),
             ("code_action_kinds", ["result", "capabilities", "codeActionProvider", "codeActionKinds"]),
             ("code_format_provider", ["result", "capabilities", "documentFormattingProvider"]),
+            ("range_format_provider", ["result", "capabilities", "documentRangeFormattingProvider"]),
             ("signature_help_provider", ["result", "capabilities", "signatureHelpProvider"]),
             ("workspace_symbol_provider", ["result", "capabilities", "workspaceSymbolProvider"]),
-            ("inlay_hint_provider", ["result", "capabilities", "inlayHintProvider", "resolveProvider"]),
+            ("inlay_hint_provider", [
+                ["result", "capabilities", "inlayHintProvider"],
+                ["result", "capabilities", "inlayHintProvider", "resolveProvider"],
+                ["result", "capabilities", "clangdInlayHintsProvider"]
+            ]),
             ("save_include_text", ["result", "capabilities", "textDocumentSync", "save", "includeText"]),
             ("text_document_sync", ["result", "capabilities", "textDocumentSync"]),
             ("semantic_tokens_provider", ["result", "capabilities", "semanticTokensProvider"])]
@@ -625,8 +778,12 @@ class LspServer:
         for attr, path in attributes_to_set:
             self.set_attribute_from_message(message, attr, path)
 
+        # If the returned result is a dict, dig the deeper attributes.
         if isinstance(self.text_document_sync, dict):
             self.text_document_sync = self.text_document_sync.get("change", self.text_document_sync)
+
+        if isinstance(self.range_format_provider, dict):
+            self.range_format_provider = self.range_format_provider.get("rangesSupport", self.range_format_provider)
 
         # Some LSP server has inlayHint capability, but won't response inlayHintProvider in capability message.
         # So we set `inlay_hint_provider` to True if found `forceInlayHint` option in config file.
@@ -668,6 +825,65 @@ class LspServer:
                 else:
                     self.handle_workspace_message(message)
 
+    def handle_work_done_progress_message(self, message):
+        if "method" in message and message["method"] in ["window/workDoneProgress/create", "$/progress"]:
+            # We need respond to request 'window/workDoneProgress/create',
+            # otherwise LSP server won't respond
+            if message["method"] == "window/workDoneProgress/create":
+                self.sender.send_response(message["id"], None) # use None to make sure respond to LSP server nextls
+
+            progress_message = ""
+
+            kind_attr = get_nested_value(message, ["params", "value", "kind"])
+            token_attr = get_nested_value(message, ["params", "token"])
+            message_attr = get_nested_value(message, ["params", "value", "message"])
+            title_attr = get_nested_value(message, ["params", "value", "title"])
+            percentage_attr = get_nested_value(message, ["params", "value", "percentage"])
+
+            if kind_attr is not None:
+                if kind_attr == "begin":
+                    self.work_done_progress_title = title_attr
+                elif kind_attr == "end":
+                    self.work_done_progress_title = ""
+
+            if title_attr is not None:
+                progress_message += str(title_attr)
+            else:
+                if kind_attr == "report":
+                    if self.work_done_progress_title != "":
+                        progress_message += str(self.work_done_progress_title)
+                    else:
+                        progress_message += str(token_attr)
+
+            if percentage_attr is not None and percentage_attr > 0:
+                progress_message += " (" + str(percentage_attr) + "%%)"
+
+            if message_attr is not None:
+                if progress_message != "":
+                    progress_message += " " + str(message_attr)
+                else:
+                    progress_message += str(message_attr)
+
+            if progress_message != "":
+                eval_in_emacs("lsp-bridge--record-work-done-progress", "[LSP-Bridge] " + progress_message)
+
+    def handle_register_capability_message(self, message):
+        if "method" in message and message["method"] in ["client/registerCapability"]:
+            try:
+                for registration in message["params"]["registrations"]:
+                    if registration["id"] == "workspace/didChangeWatchedFiles":
+                        workspace_watch_files = self.parse_workspace_watch_files(message["params"])
+                        self.monitor_workspace_files(workspace_watch_files)
+                        log_time("Add workspace watch files: {}".format(workspace_watch_files))
+                    elif registration["id"] == "textDocument/formatting":
+                        self.code_format_provider = True
+                    elif registration["id"] == "textDocument/rangeFormatting":
+                        self.range_format_provider = True
+            except:
+                log_time(traceback.format_exc())
+
+            self.sender.send_response(message["id"], None)
+
     def handle_recv_message(self, message: dict):
         if "error" in message:
             self.handle_error_message(message)
@@ -677,8 +893,87 @@ class LspServer:
         self.handle_diagnostics_message(message)
         self.handle_log_message(message)
         self.handle_id_message(message)
+        self.handle_work_done_progress_message(message)
+        self.handle_register_capability_message(message)
 
         logger.debug(json.dumps(message, indent=3))
+
+    def start_workspace_watch_files(self):
+        if self.workspace_file_watcher is None:
+            self.workspace_file_watcher = Observer()
+            self.workspace_file_watcher.start()
+
+        if self.workspace_file_watch_handler is None:
+            self.workspace_file_watch_handler = MultiFileHandler(self)
+
+    def stop_workspace_watch_files(self):
+        if self.workspace_file_watcher:
+            self.workspace_file_watcher.unschedule_all()
+            self.workspace_file_watcher.stop()
+
+            self.workspace_file_watcher = None
+            self.workspace_file_watch_handler = None
+
+    def monitor_workspace_files(self, file_paths):
+        if len(file_paths) > 0:
+            # Init workspace watch files vars.
+            self.start_workspace_watch_files()
+
+            # Add workspace file in monitor list.
+            for file_path in file_paths:
+                # Add file path in notify list.
+                self.workspace_file_watch_handler.add_file(file_path)
+
+                # Only monitor directory once.
+                target_dir = os.path.dirname(file_path)
+                if target_dir not in self.workspace_file_watch_handler.dir_path_dict:
+                    self.workspace_file_watcher.schedule(self.workspace_file_watch_handler, target_dir, recursive=False)
+                    self.workspace_file_watch_handler.add_dir(target_dir)
+
+    def parse_workspace_watch_files(self, params):
+        patterns = []
+        for registration in params['registrations']:
+            if registration.get('method') == 'workspace/didChangeWatchedFiles':
+                watchers = registration.get('registerOptions', {}).get('watchers', [])
+                for watcher in watchers:
+                    glob_pattern = watcher.get('globPattern', {})
+                    if isinstance(glob_pattern, str):
+                        if not glob_pattern.startswith('**/**.'):
+                            patterns.append(glob_pattern)
+                    elif isinstance(glob_pattern, dict):
+                        base_uri = glob_pattern.get('baseUri', '')
+                        pattern = glob_pattern.get('pattern', '')
+
+                        # Filter **/*.ext rule.
+                        if pattern.startswith('**/*.'):
+                            continue
+
+                        if base_uri.startswith('file://'):
+                            base_uri = base_uri[7:]
+
+                        # Replace ** with base_uri
+                        if pattern.startswith('**'):
+                            full_pattern = os.path.join(base_uri, pattern[2:].lstrip('/'))
+                        else:
+                            full_pattern = os.path.join(base_uri, pattern)
+
+                        # Handle {a,b} syntax
+                        if '{' in full_pattern and '}' in full_pattern:
+                            prefix, suffix = full_pattern.split('{')
+                            suffix = suffix.split('}')
+                            options = suffix[0].split(',')
+                            for option in options:
+                                patterns.append(prefix + option + suffix[1])
+                        else:
+                            patterns.append(full_pattern)
+
+        # Remove duplicate file.
+        paths = list(set(patterns))
+
+        # Filter path that it's parent directory is not exist.
+        files = list(filter(lambda path: os.path.exists(os.path.dirname(path)), paths))
+
+        return files
 
     def close_file(self, filepath):
         # Send didClose notification when client close file.
@@ -688,17 +983,21 @@ class LspServer:
 
         # We need shutdown LSP server when last file closed, to save system memory.
         if len(self.files) == 0:
-            self.send_shutdown_request()
-            self.send_exit_notification()
+            # Stop workspace file watcher.
+            self.stop_workspace_watch_files()
 
             self.message_queue.put({
                 "name": "server_process_exit",
                 "content": self.server_name
             })
+            self.exit()
 
-            # Don't need to wait LSP server response, kill immediately.
-            if self.lsp_subprocess is not None:
-                try:
-                    os.kill(self.lsp_subprocess.pid, 9)
-                except ProcessLookupError:
-                    log_time("LSP server {} ({}) already exited!".format(self.server_info["name"], self.lsp_subprocess.pid))
+    def exit(self):
+        self.send_shutdown_request()
+        self.send_exit_notification()
+        # Don't need to wait LSP server response, kill immediately.
+        if self.lsp_subprocess is not None:
+            try:
+                os.kill(self.lsp_subprocess.pid, 9)
+            except ProcessLookupError:
+                log_time("LSP server {} ({}) already exited!".format(self.server_info["name"], self.lsp_subprocess.pid))
