@@ -18,7 +18,6 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
-import json
 import logging
 import os
 import pathlib
@@ -104,40 +103,38 @@ def merge_emacs_exec_path():
     if not is_merge_emacs_exec_path:
         paths = os.environ["PATH"].split(":")
         [emacs_paths, ] = get_emacs_vars(["exec-path"])
-        new_paths = list(dict.fromkeys(paths + emacs_paths))
+        all_paths = [i for i in paths + emacs_paths if not isinstance(i,list)]
+        new_paths = list(dict.fromkeys(all_paths))
 
         os.environ["PATH"] = ":".join(new_paths)
 
         is_merge_emacs_exec_path = True
 
-lsp_file_host = ""
-def set_lsp_file_host(host):
-    global lsp_file_host
-    lsp_file_host = host
+lsp_bridge_server = None
+def set_lsp_bridge_server(bridge):
+    global lsp_bridge_server
+    lsp_bridge_server = bridge
 
 def get_lsp_file_host():
-    global lsp_file_host
-    return lsp_file_host
-
-remote_file_server = None
-def set_remote_file_server(server):
-    global remote_file_server
-
-    remote_file_server = server
+    global lsp_bridge_server
+    if lsp_bridge_server and lsp_bridge_server.file_command_server:
+        return lsp_bridge_server.file_command_server.client_address[0]
+    else:
+        return ""
 
 def get_buffer_content(filename, buffer_name):
-    global remote_file_server, lsp_file_host
+    global lsp_bridge_server
 
-    if lsp_file_host != "":
-        return remote_file_server.file_dict[filename]
+    if lsp_bridge_server and lsp_bridge_server.file_server:
+        return lsp_bridge_server.file_server.get_file_content(filename)
     else:
         return get_emacs_func_result('get-buffer-content', buffer_name)
 
 def get_file_content_from_file_server(filename):
-    global remote_file_server
+    global lsp_bridge_server
 
-    if filename in remote_file_server.file_dict:
-        return remote_file_server.file_dict[filename]
+    if lsp_bridge_server and lsp_bridge_server.file_server:
+        return lsp_bridge_server.file_server.get_file_content(filename)
     else:
         return ""
 
@@ -147,53 +144,51 @@ def get_current_line():
 def get_ssh_password(user, host, port):
     return get_emacs_func_result('get-ssh-password', user, host, port)
 
-remote_tramp_connection_info = ""
-def set_remote_tramp_connection_info(tramp_connection_info):
-    global remote_tramp_connection_info
-    remote_tramp_connection_info = tramp_connection_info
+remote_connection_info = ""
+def set_remote_connection_info(remote_info):
+    global remote_connection_info
+    remote_connection_info = remote_info
 
-def get_remote_tramp_connection_info():
-    global remote_tramp_connection_info
-    return remote_tramp_connection_info
+def get_remote_connection_info():
+    global remote_connection_info
+    return remote_connection_info
 
-remote_eval_socket = None
-def set_remote_eval_socket(socket):
-    global remote_eval_socket
+def convert_workspace_edit_path_to_tramped_path(edit, remote_connection_info):
+    """ Convert documentUris in a WorkspaceEdit instance from local to remote(tramp).
 
-    remote_eval_socket = socket
+        ex. 'file://...' --> 'file://ssh:...
 
-remote_rpc_socket = None
-remote_rpc_host = None
-def set_remote_rpc_socket(socket, host):
-    global remote_rpc_socket
-    global remote_rpc_host
+        About WorkspaceEdit interfeface:
+        https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#workspaceEdit
+    """
+    if "documentChanges" in edit:
+        # documentChanges's item can be one of (TextDocumentEdit, CreateFile, DeleteFile, RenameFile)
+        for change in edit["documentChanges"]:
+            if change.get("textDocument", {}).get("uri") is not None:
+                # TextDocumentEdit
+                change["textDocument"]["uri"] = local_path_to_tramp_path(change["textDocument"]["uri"], remote_connection_info)
+            elif "uri" in change:
+                # CreateFile | DeleteFile
+                change["uri"] = local_path_to_tramp_path(change["uri"], remote_connection_info)
+            elif "oldUri" in change:
+                # RenameFile
+                change["oldUri"] = local_path_to_tramp_path(change["oldUri"], remote_connection_info)
+                change["newUri"] = local_path_to_tramp_path(change["newUri"], remote_connection_info)
+    elif "changes" in edit:
+        changes = edit["changes"]
+        new_changes = {}
+        for file in changes.keys():
+            tramp_file = local_path_to_tramp_path(file, remote_connection_info)
+            new_changes[tramp_file] = changes[file]
+        edit["changes"] = new_changes
 
-    remote_rpc_socket = socket
-    remote_rpc_host = host
-
-def get_remote_rpc_socket():
-    global remote_rpc_socket
-    global remote_rpc_host
-    return remote_rpc_socket, remote_rpc_host
-
-def call_remote_rpc(message):
-    remote_rpc_socket, remote_rpc_host = get_remote_rpc_socket()
-
-    if remote_rpc_socket is not None:
-        message["host"] = remote_rpc_host
-        data = json.dumps(message)
-        remote_rpc_socket.send(f"{data}\n".encode("utf-8"))
-
-        socket_file = remote_rpc_socket.makefile("r")
-        result = socket_file.readline().strip()
-        socket_file.close()
-
-        return result
-    else:
-        return None
+def local_path_to_tramp_path(path, tramp_method):
+    """convert path in DocumentUri format to tramp format."""
+    tramp_path = path.replace("file://", "file://" + tramp_method)
+    return tramp_path
 
 def eval_in_emacs(method_name, *args):
-    global remote_eval_socket
+    global lsp_bridge_server
 
     if test_interceptor:  # for test purpose, record all eval_in_emacs calls
         test_interceptor(method_name, args)
@@ -204,13 +199,11 @@ def eval_in_emacs(method_name, *args):
     logger.debug("Eval in Emacs: %s", sexp)
 
     # Call eval-in-emacs elisp function.
-    if remote_eval_socket:
-        message = {
+    if lsp_bridge_server and lsp_bridge_server.file_command_server:
+        lsp_bridge_server.file_command_server.send_message({
             "command": "eval-in-emacs",
             "sexp": [sexp]
-        }
-        data = json.dumps(message)
-        remote_eval_socket.send(f"{data}\n".encode("utf-8"))
+        })
     else:
         epc_client.call("eval-in-emacs", [sexp])    # type: ignore
 
@@ -260,29 +253,27 @@ def convert_emacs_bool(symbol_value, symbol_is_boolean):
 
 
 def get_emacs_vars(args):
-    global remote_rpc_socket
+    global lsp_bridge_server
 
-    if remote_rpc_socket:
-        results = call_remote_rpc({
+    if lsp_bridge_server and lsp_bridge_server.file_elisp_server:
+        return lsp_bridge_server.file_elisp_server.call_remote_rpc({
             "command": "get_emacs_vars",
             "args": args
         })
-        return parse_json_content(results)
     else:
         results = epc_client.call_sync("get-emacs-vars", args)
         return list(map(lambda result: convert_emacs_bool(result[0], result[1]) if result != [] else False, results))
 
 def get_emacs_func_result(method_name, *args):
     """Call eval-in-emacs elisp function synchronously and return the result."""
-    global remote_rpc_socket
+    global lsp_bridge_server
 
-    if remote_rpc_socket:
-        result = call_remote_rpc({
+    if lsp_bridge_server and lsp_bridge_server.file_elisp_server:
+        return lsp_bridge_server.file_elisp_server.call_remote_rpc({
             "command": "get_emacs_func_result",
             "method": method_name,
             "args": args
         })
-        return parse_json_content(result)
     else:
         result = epc_client.call_sync(method_name, args)    # type: ignore
         return result
@@ -400,13 +391,27 @@ def get_project_path(filepath):
         import os
         dir_path = os.path.dirname(filepath)
         if get_command_result("git rev-parse --is-inside-work-tree", dir_path) == "true":
-            return get_command_result("git rev-parse --show-toplevel", dir_path)
+            path_from_git = get_command_result("git rev-parse --show-toplevel", dir_path)
+            if get_os_name() == "windows":
+                path_parts = path_from_git.split("/")
+                # if this is a Unix-style absolute path, which should be a Windows-style one
+                if path_parts[0] == "/":
+                    windows_path = path_parts[1] + ":/" + "/".join(path_parts[2:])
+                    return windows_path
+                else:
+                    return path_from_git
+            else:
+                return path_from_git
         else:
             return filepath
 
 def log_time(message):
     import datetime
     logger.info("\n--- [{}] {}".format(datetime.datetime.now().time(), message))
+
+def log_time_debug(message):
+    import datetime
+    logger.debug("\n--- [{}] {}".format(datetime.datetime.now().time(), message))
 
 def get_os_name():
     return platform.system().lower()
@@ -435,26 +440,39 @@ def is_valid_ip(ip):
 
 def is_valid_ip_path(ssh_path):
     """Check if SSH-PATH is a valid ssh path."""
-    pattern = r"^(?:([a-z_][a-z0-9_-]*)@)?((?:[0-9]{1,3}\.){3}[0-9]{1,3})(?::(\d+))?:~?(.*)$"
+    pattern = r"^/?(?:([a-z_][a-z0-9_\.-]*)@)?((?:[0-9]{1,3}\.){3}[0-9]{1,3})(?::(\d+))?:~?(.*)$"
     match = re.match(pattern, ssh_path)
     return match is not None
 
 def split_ssh_path(ssh_path):
     """Split SSH-PATH into username, host, port and path."""
-    pattern = r"^(?:([a-z_][a-z0-9_-]*)@)?((?:[0-9]{1,3}\.){3}[0-9]{1,3})(?::(\d+))?:?(.*)$"
+    pattern = r"^/?((?:([a-z_][a-z0-9_\.-]*)@)?((?:[0-9]{1,3}\.){3}[0-9]{1,3})(?::(\d+))?:?)(.*)$"
     match = re.match(pattern, ssh_path)
     if match:
-        username, host, port, path = match.groups()
-        if not username:
-            username = None
-        if not port:
-            port = None
-        return (username, host, port, path)
+        remote_info, username, host, port, path = match.groups()
+        ssh_conf = {'hostname' : host}
+        if username:
+            ssh_conf['user'] = username
+        if port:
+            ssh_conf['port'] = port
+        return (remote_info, host, ssh_conf, path)
+    else:
+        return None
+
+def split_docker_path(docker_path):
+    # Pattern to extract username, container name, and path
+    pattern = r"^/docker:(?P<username>[^@]+)@(?P<container_name>[^:]+):(?P<path>/.*)$"
+    match = re.match(pattern, docker_path)
+    if match:
+        username = match.group('username')
+        container_name = match.group('container_name')
+        path = match.group('path')
+        return (username, container_name, path)
     else:
         return None
 
 def is_remote_path(filepath):
-    return filepath.startswith("/ssh:")
+    return filepath.startswith("/ssh:") or filepath.startswith("/docker:")
 
 def eval_sexp_in_emacs(sexp):
     epc_client.call("eval-in-emacs", [sexp])
@@ -472,7 +490,7 @@ def get_position(content, line, character):
     position = sum(len(lines[i]) + 1 for i in range(line)) + character
     return position
 
-def replace_template(arg):
+def replace_template(arg, project_path=None):
     if "%USER_EMACS_DIRECTORY%" in arg:
         if get_os_name() == "windows":
             user_emacs_dir = get_emacs_func_result("get-user-emacs-directory").replace("/", "\\")
@@ -480,14 +498,24 @@ def replace_template(arg):
             user_emacs_dir = get_emacs_func_result("get-user-emacs-directory")
         return arg.replace("%USER_EMACS_DIRECTORY%", user_emacs_dir)
     elif "$HOME" in arg:
-            return os.path.expandvars(arg)
+        return os.path.expandvars(arg)
     elif "%FILEHASH%" in arg:
         # pyright use `--cancellationReceive` option enable "background analyze" to improve completion performance.
         return arg.replace("%FILEHASH%", os.urandom(21).hex())
     elif "%USERPROFILE%" in arg:
-        return arg.replace("%USERPROFILE%", windows_get_env_value("USERPROFILE"))
+        return arg.replace("%USERPROFILE%", repr(windows_get_env_value("USERPROFILE")).strip("'"))
+    elif "%TSDK_PATH%" in arg:
+        return arg.replace("%TSDK_PATH%", repr(get_emacs_func_result("get-user-tsdk-path")).strip("'"))
     else:
         return arg
+
+def find_csharp_solution_file(directory):
+    for root, dirs, files in os.walk(directory):
+        for file in files:
+            if file.endswith(".sln"):
+                return os.path.join(root, file)
+
+    return None
 
 def touch(path):
     import os
@@ -521,6 +549,31 @@ def remove_duplicate_references(data):
             seen.add(t_item)
             result.append(item)
     return result
+
+def get_value_from_path(data, path):
+    """
+    Retrieve a value from a nested dictionary based on the given path.
+    """
+    for key in path:
+        if isinstance(data, dict) and key in data:
+            data = data[key]
+        else:
+            return None
+    return data
+
+def get_nested_value(json_data, attribute_path):
+    """
+    Find the corresponding value in json_data based on the attribute_path.
+    Handles both single paths and nested list paths.
+    """
+    if isinstance(attribute_path[0], list):  # Handle nested list case
+        for path in attribute_path:
+            value = get_value_from_path(json_data, path)
+            if value is not None:
+                return value
+        return None
+    else:
+        return get_value_from_path(json_data, attribute_path)
 
 class MessageSender(Thread):
 

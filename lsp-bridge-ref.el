@@ -407,6 +407,8 @@ user more freedom to use rg with special arguments."
     ;; Highlight references.
     (goto-char (point-min))
     (while (re-search-forward "\033\\[94m\\([^\033]*\\)\033\\[0m" nil t)
+      ;; We need set keyword when popup references
+      (setf (lsp-bridge-ref-search-keyword lsp-bridge-ref-cur-search) (match-string 1))
       (replace-match (concat (propertize (match-string 1)
                                          'face nil 'font-lock-face 'lsp-bridge-ref-font-lock-match))
                      t t))
@@ -441,7 +443,7 @@ user more freedom to use rg with special arguments."
 (defun lsp-bridge-ref-get-match-file ()
   (save-excursion
     (search-backward-regexp lsp-bridge-ref-regexp-file nil t)
-    (string-remove-suffix "\n" (thing-at-point 'line))))
+    (substring-no-properties (string-remove-suffix "\n" (thing-at-point 'line)))))
 
 (defun lsp-bridge-ref-get-match-line ()
   (beginning-of-line)
@@ -453,9 +455,11 @@ user more freedom to use rg with special arguments."
 
 (defun lsp-bridge-ref-get-match-buffer (filepath)
   (cl-dolist (buffer (buffer-list))
-    (when (string-equal (buffer-file-name buffer) filepath)
-      (cl-return buffer)
-      )))
+    (let* ((buf-file-name (buffer-file-name buffer))
+           (file-name (if (stringp buf-file-name) (substring-no-properties buf-file-name) buf-file-name)))
+      (when (string-equal file-name filepath)
+        (cl-return buffer)
+        ))))
 
 (defun lsp-bridge-ref-current-line-empty-p ()
   (save-excursion
@@ -815,6 +819,19 @@ user more freedom to use rg with special arguments."
     (lsp-bridge-ref-quit t)
     (insert current-line)))
 
+(defvar lsp-bridge-ref-open-remote-file-go-back-to-ref-window nil)
+(defun lsp-bridge-switch-to-ref-window ()
+  ;; Keep cursor in search buffer's window.
+  (setq ref-buffer-window (get-buffer-window lsp-bridge-ref-buffer))
+  (if ref-buffer-window
+      (select-window ref-buffer-window)
+    (if lsp-bridge-ref-delete-other-windows
+        (delete-other-windows))
+    ;; Split window and select if color-buffer is not exist in windows.
+    (split-window)
+    (other-window 1)
+    (switch-to-buffer lsp-bridge-ref-buffer)))
+
 (defun lsp-bridge-ref-open-file (&optional stay)
   (interactive)
   (let* ((match-file (lsp-bridge-ref-get-match-file))
@@ -837,35 +854,34 @@ user more freedom to use rg with special arguments."
                  (window-valid-p lsp-bridge-ref-request-search-window))
             (select-window lsp-bridge-ref-request-search-window)
           (other-window 1))
-        (find-file match-file)
-        ;; Add to temp list if file's buffer is not exist.
-        (unless match-buffer
-          (add-to-list 'lsp-bridge-ref-temp-visit-buffers (current-buffer)))
-        ;; Jump to match point.
-        ;; We use `ignore-errors' to make sure cursor will back to lsp-bridge-ref buffer
-        ;; even target line is not exists in search file (such as delete by user).
-        (ignore-errors
-          (lsp-bridge-ref-move-to-point match-line match-column)
-          (when (lsp-bridge-ref-is-org-file match-file)
-            ;; Expand org block if current file is *.org file.
-            (org-reveal)
-            ;; Jump to link beginning if keyword in content area.
-            (when in-org-link-content-p
-              (search-backward-regexp "\\[\\[" (line-beginning-position) t))
-            )))
+        (if (and (not lsp-bridge-enable-with-tramp)
+                 (string-match-p lsp-bridge-remote-file-pattern match-file))
+            (progn
+              (setq lsp-bridge-remote-file-window (selected-window))
+              (setq lsp-bridge-ref-open-remote-file-go-back-to-ref-window (not stay))
+              (lsp-bridge-call-async "open_remote_file" match-file
+                                     (list :line (1- match-line) :character match-column))
+              (cl-return))
+          (find-file match-file)
+          ;; Add to temp list if file's buffer is not exist.
+          (unless match-buffer
+            (add-to-list 'lsp-bridge-ref-temp-visit-buffers (current-buffer)))
+          ;; Jump to match point.
+          ;; We use `ignore-errors' to make sure cursor will back to lsp-bridge-ref buffer
+          ;; even target line is not exists in search file (such as delete by user).
+          (ignore-errors
+            (lsp-bridge-ref-move-to-point match-line match-column)
+            (when (lsp-bridge-ref-is-org-file match-file)
+              ;; Expand org block if current file is *.org file.
+              (org-reveal)
+              ;; Jump to link beginning if keyword in content area.
+              (when in-org-link-content-p
+                (search-backward-regexp "\\[\\[" (line-beginning-position) t))
+              ))))
       ;; Flash match line.
       (lsp-bridge-ref-flash-line))
     (unless stay
-      ;; Keep cursor in search buffer's window.
-      (setq ref-buffer-window (get-buffer-window lsp-bridge-ref-buffer))
-      (if ref-buffer-window
-          (select-window ref-buffer-window)
-        (if lsp-bridge-ref-delete-other-windows
-            (delete-other-windows))
-        ;; Split window and select if color-buffer is not exist in windows.
-        (split-window)
-        (other-window 1)
-        (switch-to-buffer lsp-bridge-ref-buffer)))
+      (lsp-bridge-switch-to-ref-window))
     ;; Ajust column position.
     (lsp-bridge-ref-move-to-column match-column)
     ))
@@ -880,7 +896,7 @@ user more freedom to use rg with special arguments."
   ;; View the function name when navigate in match line.
   (when lsp-bridge-ref-show-function-name-p
     (require 'which-func)
-    (when-let ((function-name (which-function)))
+    (when-let* ((function-name (which-function)))
       (message "[LSP-Bridge] Located in function: %s"
                (propertize
                 function-name
